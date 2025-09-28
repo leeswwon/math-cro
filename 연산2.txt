@@ -1,0 +1,799 @@
+import React, { useState, useEffect, useCallback } from 'react';
+import { GoogleGenAI, Type } from "@google/genai";
+import type { Puzzle, GridCell, CellPosition, GameStatus, Difficulty } from './types';
+import { CellType } from './types';
+import GameHeader from './components/GameHeader';
+import GameBoard from './components/GameBoard';
+import NumberPad from './components/NumberPad';
+import GameOverlay from './components/GameOverlay';
+import LoadingSpinner from './components/LoadingSpinner';
+
+const MAX_MISTAKES = 3;
+
+const getDifficultyForLevel = (lvl: number): Difficulty => {
+  if (lvl > 5) return 'Hard';
+  if (lvl > 2) return 'Medium';
+  return 'Easy';
+};
+
+const App: React.FC = () => {
+  const [gameStatus, setGameStatus] = useState<GameStatus>('LOADING');
+  const [puzzle, setPuzzle] = useState<Puzzle | null>(null);
+  const [boardState, setBoardState] = useState<GridCell[][]>([]);
+  const [selectedCell, setSelectedCell] = useState<CellPosition | null>(null);
+  const [mistakes, setMistakes] = useState(0);
+  const [score, setScore] = useState(0);
+  const [highScore, setHighScore] = useState(0);
+  const [level, setLevel] = useState(1);
+  const [difficulty, setDifficulty] = useState<Difficulty>('Easy');
+  const [wrongInputCell, setWrongInputCell] = useState<CellPosition | null>(null);
+  const [preloadedPuzzle, setPreloadedPuzzle] = useState<{ puzzle: Puzzle; difficulty: Difficulty } | null>(null);
+
+  useEffect(() => {
+    const savedHighScore = localStorage.getItem('mathCrosswordHighScore');
+    if (savedHighScore) {
+      setHighScore(parseInt(savedHighScore, 10));
+    }
+  }, []);
+
+  useEffect(() => {
+    if (score > highScore) {
+      setHighScore(score);
+      localStorage.setItem('mathCrosswordHighScore', String(score));
+    }
+  }, [score, highScore]);
+
+  const fetchPuzzleFromAI = async (difficultyToFetch: Difficulty): Promise<Puzzle> => {
+    if (!process.env.API_KEY) {
+      throw new Error("API_KEY environment variable not set");
+    }
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+
+    const responseSchema = {
+      type: Type.OBJECT,
+      properties: {
+        grid: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                type: { type: Type.STRING, enum: ['GIVEN', 'INPUT', 'EMPTY'] },
+                value: { type: Type.STRING },
+              },
+               required: ['type', 'value'],
+            },
+          },
+        },
+        solution: {
+          type: Type.ARRAY,
+          items: {
+              type: Type.OBJECT,
+              properties: {
+                  key: { 
+                      type: Type.STRING,
+                      description: 'The coordinate of an INPUT cell, e.g. "row,col"'
+                  },
+                  value: { 
+                      type: Type.NUMBER,
+                      description: 'The correct number for that cell.'
+                  },
+              },
+              required: ['key', 'value'],
+          }
+        },
+        keypad: {
+          type: Type.ARRAY,
+          items: { type: Type.NUMBER },
+        },
+      },
+      required: ['grid', 'solution', 'keypad'],
+    };
+
+    const prompt = `Create a number puzzle for difficulty: ${difficultyToFetch}.
+The grid must be 8x8.
+The puzzle should be a grid with some numbers pre-filled, some empty cells for the user to fill, and some non-playable blank spaces. The numbers can be multi-digit.
+The grid should be sparse and form an interesting, non-rectangular shape.
+Use these cell types and values:
+- 'GIVEN': For pre-filled numbers. The 'value' property must be a string containing the number.
+- 'INPUT': For empty cells the user must fill in. The 'value' property must be an empty string "".
+- 'EMPTY': For blank, non-playable spaces that define the shape of the puzzle. The 'value' property must be an empty string "".
+
+The response must be a valid JSON object matching the provided schema.
+- 'grid': An 8x8 array representing the puzzle board.
+- 'solution': An array of objects for each 'INPUT' cell. Each object must have a 'key' (a "row,col" string) and a 'value' (the correct number). There must be at least 5 INPUT cells.
+- 'keypad': An array of 15 numbers. It must contain all the correct numbers for the solution, plus some distractor numbers. The numbers should be shuffled.`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: prompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: responseSchema,
+      },
+    });
+
+    interface PuzzleResponse {
+      grid: GridCell[][];
+      solution: Array<{ key: string; value: number }>;
+      keypad: number[];
+    }
+    const puzzleResponse = JSON.parse(response.text) as PuzzleResponse;
+
+    if (
+        !puzzleResponse ||
+        !Array.isArray(puzzleResponse.grid) || puzzleResponse.grid.length !== 8 ||
+        !puzzleResponse.grid.every(row => Array.isArray(row) && row.length === 8 && row.every(cell => typeof cell.type === 'string' && typeof cell.value === 'string')) ||
+        !Array.isArray(puzzleResponse.solution) || puzzleResponse.solution.length === 0 ||
+        !Array.isArray(puzzleResponse.keypad) || puzzleResponse.keypad.length === 0
+    ) {
+        console.error("Invalid puzzle format received from API:", puzzleResponse);
+        throw new Error("Invalid puzzle format from API");
+    }
+    
+    const solutionMap = puzzleResponse.solution.reduce((acc, item) => {
+      acc[item.key] = item.value;
+      return acc;
+    }, {} as Record<string, number>);
+
+    return {
+        grid: puzzleResponse.grid,
+        solution: solutionMap,
+        keypad: puzzleResponse.keypad
+    };
+  };
+
+  const preloadPuzzle = useCallback(async (forLevel: number) => {
+    if (preloadedPuzzle) return; // A puzzle is already preloaded
+
+    const nextDifficulty = getDifficultyForLevel(forLevel);
+    try {
+      const puzzleData = await fetchPuzzleFromAI(nextDifficulty);
+      setPreloadedPuzzle({ puzzle: puzzleData, difficulty: nextDifficulty });
+    } catch (error) {
+      console.error("Failed to preload puzzle:", error);
+      // Fail silently, don't disrupt the user.
+    }
+  }, [preloadedPuzzle]);
+
+  const generatePuzzle = useCallback(async (currentDifficulty: Difficulty) => {
+    setGameStatus('LOADING');
+    setSelectedCell(null);
+    try {
+      const puzzleData = await fetchPuzzleFromAI(currentDifficulty);
+      setPuzzle(puzzleData);
+      setBoardState(puzzleData.grid);
+      setGameStatus('PLAYING');
+      setMistakes(0);
+      preloadPuzzle(level + 1);
+    } catch (error) {
+      console.error("Failed to generate puzzle:", error);
+      setGameStatus('ERROR');
+    }
+  }, [level, preloadPuzzle]);
+
+  const startNewGame = useCallback(() => {
+    const currentDifficulty = getDifficultyForLevel(level);
+    setDifficulty(currentDifficulty);
+
+    if (preloadedPuzzle && preloadedPuzzle.difficulty === currentDifficulty) {
+      setPuzzle(preloadedPuzzle.puzzle);
+      setBoardState(preloadedPuzzle.puzzle.grid);
+      setGameStatus('PLAYING');
+      setMistakes(0);
+      setSelectedCell(null);
+      setPreloadedPuzzle(null);
+      preloadPuzzle(level + 1);
+    } else {
+      generatePuzzle(currentDifficulty);
+    }
+  }, [level, preloadedPuzzle, generatePuzzle, preloadPuzzle]);
+
+  const retryLevel = useCallback(() => {
+    if (!puzzle) {
+      startNewGame();
+      return;
+    }
+    setBoardState(puzzle.grid);
+    setMistakes(0);
+    setSelectedCell(null);
+    setGameStatus('PLAYING');
+  }, [puzzle, startNewGame]);
+
+
+  useEffect(() => {
+    startNewGame();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [level]);
+
+  const handleCellClick = (row: number, col: number) => {
+    if (gameStatus !== 'PLAYING') return;
+    const cell = boardState[row][col];
+    if (cell && cell.type === CellType.INPUT) {
+      setSelectedCell({ row, col });
+    } else {
+      setSelectedCell(null);
+    }
+  };
+
+  const handleNumberPadClick = (num: number) => {
+    if (!selectedCell || gameStatus !== 'PLAYING' || !puzzle) return;
+
+    const { row, col } = selectedCell;
+    const solutionKey = `${row},${col}`;
+
+    if (puzzle.solution[solutionKey] === num) {
+      const newBoardState = boardState.map(r => r.map(c => ({...c})));
+      newBoardState[row][col] = { type: CellType.GIVEN, value: String(num) };
+      setBoardState(newBoardState);
+      setScore(prev => prev + 10);
+      setSelectedCell(null);
+
+      const isWon = Object.keys(puzzle.solution).every(key => {
+        const [r, c] = key.split(',').map(Number);
+        const cell = newBoardState[r][c];
+        return cell.type === CellType.GIVEN;
+      });
+
+      if (isWon) {
+        setGameStatus('WON');
+        setScore(prev => prev + 100);
+      }
+    } else {
+      const newMistakes = mistakes + 1;
+      setMistakes(newMistakes);
+      setWrongInputCell(selectedCell);
+      setTimeout(() => setWrongInputCell(null), 300);
+      if (newMistakes >= MAX_MISTAKES) {
+        const solutionBoard = boardState.map((r, rowIndex) =>
+          r.map((c, colIndex) => {
+            const currentSolutionKey = `${rowIndex},${colIndex}`;
+            const correctValue = puzzle.solution[currentSolutionKey];
+            if (correctValue !== undefined && c.type === CellType.INPUT) {
+              return { ...c, value: String(correctValue), type: CellType.REVEALED };
+            }
+            return c;
+          })
+        );
+        setBoardState(solutionBoard);
+        setGameStatus('LOST');
+      }
+    }
+  };
+
+  const goToNextLevel = () => {
+    setLevel(prev => prev + 1);
+  };
+
+  const startOverFromLevel1 = () => {
+    setScore(0);
+    setLevel(1);
+  };
+  
+  return (
+    <div className="flex flex-col items-center justify-center min-h-screen bg-gray-100 p-4 text-slate-800">
+      <div className="w-full max-w-sm mx-auto bg-white rounded-2xl shadow-lg p-4 flex flex-col gap-4">
+        <GameHeader
+          level={level}
+          score={score}
+          highScore={highScore}
+          mistakes={mistakes}
+          maxMistakes={MAX_MISTAKES}
+          onRestart={startNewGame}
+          difficulty={difficulty}
+        />
+        <div className="relative">
+          {gameStatus === 'LOADING' && (
+            <div className="absolute inset-0 bg-white/90 backdrop-blur-sm flex items-center justify-center z-10 rounded-lg">
+              <LoadingSpinner />
+            </div>
+          )}
+          {(gameStatus === 'WON' || gameStatus === 'LOST' || gameStatus === 'ERROR') && 
+            <GameOverlay 
+              status={gameStatus} 
+              onNextLevel={goToNextLevel} 
+              onRestart={startNewGame}
+              onRetry={retryLevel}
+              onRestartFromLevel1={startOverFromLevel1}
+              difficulty={difficulty}
+            />
+          }
+          <GameBoard
+            grid={boardState}
+            onCellClick={handleCellClick}
+            selectedCell={selectedCell}
+            wrongInputCell={wrongInputCell}
+          />
+        </div>
+        <NumberPad
+          numbers={puzzle?.keypad || []}
+          onNumberClick={handleNumberPadClick}
+          disabled={gameStatus !== 'PLAYING'}
+        />
+      </div>
+       <footer className="text-center mt-4 text-xs text-gray-500">
+        <p>Math Crossword Puzzle generated with Gemini</p>
+      </footer>
+    </div>
+  );
+};
+
+export default App;
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Math Crossword Puzzle</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+      body {
+        font-family: 'Inter', sans-serif;
+        touch-action: manipulation;
+      }
+      @keyframes shake {
+        0%, 100% { transform: translateX(0); }
+        10%, 30%, 50%, 70%, 90% { transform: translateX(-5px); }
+        20%, 40%, 60%, 80% { transform: translateX(5px); }
+      }
+      .animate-shake {
+        animation: shake 0.3s ease-in-out;
+        border-color: #ef4444 !important; /* red-500 */
+        background-color: #fee2e2 !important; /* red-100 */
+      }
+    </style>
+  <script type="importmap">
+{
+  "imports": {
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.1.1/",
+    "react/": "https://aistudiocdn.com/react@^19.1.1/",
+    "react": "https://aistudiocdn.com/react@^19.1.1",
+    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.21.0"
+  }
+}
+</script>
+</head>
+  <body class="bg-gray-100">
+    <div id="root"></div>
+    <script type="module" src="/index.tsx"></script>
+  </body>
+</html>
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import App from './App';
+
+const rootElement = document.getElementById('root');
+if (!rootElement) {
+  throw new Error("Could not find root element to mount to");
+}
+
+const root = ReactDOM.createRoot(rootElement);
+root.render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);
+{
+  "name": "Math Crossword Puzzle",
+  "description": "A fun and challenging math crossword puzzle game to sharpen your mind. Fill in the numbers to solve the equations in the grid. Puzzles are generated by Gemini.",
+  "requestFramePermissions": []
+}
+export enum CellType {
+  GIVEN = 'GIVEN',
+  INPUT = 'INPUT',
+  EMPTY = 'EMPTY',
+  REVEALED = 'REVEALED',
+}
+
+export interface GridCell {
+  type: CellType;
+  value: string | null;
+}
+
+export interface Puzzle {
+  grid: GridCell[][];
+  solution: Record<string, number>; // key: "row,col", value: correct number
+  keypad: number[];
+}
+
+export interface CellPosition {
+  row: number;
+  col: number;
+}
+
+export type GameStatus = 'LOADING' | 'PLAYING' | 'WON' | 'LOST' | 'ERROR';
+export type Difficulty = 'Easy' | 'Medium' | 'Hard';
+import React from 'react';
+import type { GridCell, CellPosition } from '../types';
+import { CellType } from '../types';
+
+interface GameBoardProps {
+  grid: GridCell[][];
+  onCellClick: (row: number, col: number) => void;
+  selectedCell: CellPosition | null;
+  wrongInputCell: CellPosition | null;
+}
+
+const GameBoard: React.FC<GameBoardProps> = ({ grid, onCellClick, selectedCell, wrongInputCell }) => {
+  if (!grid || grid.length === 0) {
+    return <div className="aspect-square w-full bg-gray-200 rounded-lg animate-pulse"></div>;
+  }
+
+  const getCellClass = (cell: GridCell, row: number, col: number) => {
+    let baseClass = "flex items-center justify-center aspect-square text-lg md:text-xl font-bold rounded-md transition-all duration-150";
+
+    if (cell.type === CellType.EMPTY) {
+      return "bg-transparent";
+    }
+
+    baseClass += " bg-white border";
+
+    if (cell.type === CellType.GIVEN) {
+        baseClass += " border-gray-200 text-gray-900 bg-gray-50";
+    } else if (cell.type === CellType.REVEALED) {
+        baseClass += " border-gray-200 text-green-600 bg-green-50 font-bold";
+    } else if (cell.type === CellType.INPUT) {
+        baseClass += " border-gray-300 border-dashed cursor-pointer hover:bg-blue-50";
+        if (selectedCell && selectedCell.row === row && selectedCell.col === col) {
+            baseClass += " !border-blue-500 !bg-blue-100 border-solid !border-2";
+        }
+        if (wrongInputCell && wrongInputCell.row === row && wrongInputCell.col === col) {
+            baseClass += " animate-shake";
+        }
+    }
+
+    return baseClass;
+  };
+  
+  return (
+    <div className="grid grid-cols-8 gap-1 p-2 bg-white rounded-lg shadow-inner bg-gray-50 border border-gray-200" style={{ aspectRatio: '1 / 1' }}>
+      {grid.map((row, rowIndex) =>
+        row.map((cell, colIndex) => (
+          <div
+            key={`${rowIndex}-${colIndex}`}
+            className={getCellClass(cell, rowIndex, colIndex)}
+            onClick={() => onCellClick(rowIndex, colIndex)}
+          >
+            {cell.value}
+          </div>
+        ))
+      )}
+    </div>
+  );
+};
+
+export default GameBoard;
+import React from 'react';
+import type { Difficulty } from '../types';
+import { HeartIcon, RefreshCwIcon } from './Icons';
+
+interface GameHeaderProps {
+  level: number;
+  score: number;
+  highScore: number;
+  mistakes: number;
+  maxMistakes: number;
+  onRestart: () => void;
+  difficulty: Difficulty;
+}
+
+const DifficultyBadge: React.FC<{ difficulty: Difficulty }> = ({ difficulty }) => {
+  const colors = {
+    Easy: 'bg-green-100 text-green-800',
+    Medium: 'bg-yellow-100 text-yellow-800',
+    Hard: 'bg-red-100 text-red-800',
+  };
+  return (
+    <span className={`px-2 py-1 text-xs font-semibold rounded-full ${colors[difficulty]}`}>
+      {difficulty}
+    </span>
+  );
+};
+
+
+const GameHeader: React.FC<GameHeaderProps> = ({
+  level,
+  score,
+  highScore,
+  mistakes,
+  maxMistakes,
+  onRestart,
+  difficulty
+}) => {
+  return (
+    <div className="flex justify-between items-center w-full">
+      <div className='flex items-center gap-2'>
+        <button onClick={onRestart} className="p-2 text-gray-500 hover:text-gray-800 hover:bg-gray-100 rounded-full transition-colors">
+          <RefreshCwIcon className="w-5 h-5" />
+        </button>
+         <DifficultyBadge difficulty={difficulty} />
+      </div>
+
+      <div className="text-center">
+        <div className="text-sm font-semibold text-gray-500">LEVEL</div>
+        <div className="text-2xl font-bold text-gray-900">{level}</div>
+      </div>
+      <div className="text-center">
+        <div className="text-sm font-semibold text-gray-500">SCORE</div>
+        <div className="flex items-baseline justify-center gap-1">
+            <div className="text-2xl font-bold text-gray-900">{score}</div>
+            <div className="text-sm text-gray-400 font-medium">/ {highScore}</div>
+        </div>
+      </div>
+      
+      <div className="flex items-center gap-1">
+        {[...Array(maxMistakes)].map((_, i) => (
+          <HeartIcon
+            key={i}
+            className={`w-6 h-6 ${i < maxMistakes - mistakes ? 'text-red-500 fill-current' : 'text-gray-300'}`}
+          />
+        ))}
+      </div>
+    </div>
+  );
+};
+
+export default GameHeader;
+import React from 'react';
+import type { GameStatus, Difficulty } from '../types';
+import { PartyPopperIcon, FrownIcon, AlertTriangleIcon, RefreshCwIcon, ArrowRightIcon } from './Icons';
+
+interface GameOverlayProps {
+  status: GameStatus;
+  onRestart: () => void;
+  onNextLevel: () => void;
+  onRetry: () => void;
+  onRestartFromLevel1: () => void;
+  difficulty: Difficulty;
+}
+
+const GameOverlay: React.FC<GameOverlayProps> = ({ status, onRestart, onNextLevel, onRetry, onRestartFromLevel1, difficulty }) => {
+  
+  const getLostTitle = (diff: Difficulty) => {
+    switch (diff) {
+      case 'Easy': return '초등학교 실패';
+      case 'Medium': return '중학교 실패';
+      case 'Hard': return '고등학교 실패';
+      default: return 'Game Over';
+    }
+  };
+
+  const content = {
+    WON: {
+      icon: <PartyPopperIcon className="w-16 h-16 text-green-500" />,
+      title: 'Level Complete!',
+      message: 'Great job! Ready for the next challenge?',
+      buttons: (
+        <button onClick={onNextLevel} className="flex items-center justify-center gap-2 w-full px-4 py-3 bg-green-500 text-white font-bold rounded-lg hover:bg-green-600 transition-colors">
+          Next Level <ArrowRightIcon className="w-5 h-5" />
+        </button>
+      ),
+    },
+    LOST: {
+      icon: <FrownIcon className="w-16 h-16 text-red-500" />,
+      title: getLostTitle(difficulty),
+      message: "정답을 확인하고 다시 도전해보세요!",
+      buttons: (
+        <button onClick={onRestartFromLevel1} className="flex items-center justify-center gap-2 w-full px-4 py-3 bg-blue-500 text-white font-bold rounded-lg hover:bg-blue-600 transition-colors">
+          1레벨부터 다시 시작 <RefreshCwIcon className="w-5 h-5" />
+        </button>
+      ),
+    },
+    ERROR: {
+      icon: <AlertTriangleIcon className="w-16 h-16 text-yellow-500" />,
+      title: 'An Error Occurred',
+      message: 'Could not create a puzzle. Please try again.',
+      buttons: (
+         <button onClick={onRestart} className="flex items-center justify-center gap-2 w-full px-4 py-3 bg-blue-500 text-white font-bold rounded-lg hover:bg-blue-600 transition-colors">
+          Try Again <RefreshCwIcon className="w-5 h-5" />
+        </button>
+      ),
+    },
+    PLAYING: null,
+    LOADING: null,
+  };
+
+  const currentContent = content[status];
+  if (!currentContent) return null;
+
+  return (
+    <div className="absolute inset-0 bg-white/80 backdrop-blur-sm flex items-center justify-center z-20 rounded-lg">
+      <div className="text-center p-8 bg-white rounded-xl shadow-lg flex flex-col items-center gap-4 w-4/5">
+        {currentContent.icon}
+        <h2 className="text-2xl font-bold text-slate-800">{currentContent.title}</h2>
+        <p className="text-slate-600">{currentContent.message}</p>
+        <div className="w-full mt-4">
+            {currentContent.buttons}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default GameOverlay;
+import React from 'react';
+
+interface NumberPadProps {
+  numbers: number[];
+  onNumberClick: (num: number) => void;
+  disabled: boolean;
+}
+
+const NumberPad: React.FC<NumberPadProps> = ({ numbers, onNumberClick, disabled }) => {
+  // Ensure we have a consistent grid, e.g., 3x5 or similar
+  const padSize = 15;
+  const displayNumbers = [...new Set(numbers)]; // Remove duplicates for display
+  while (displayNumbers.length < padSize && displayNumbers.length > 0) {
+    // Fill remaining spots with random numbers from the existing set to ensure a full pad
+    displayNumbers.push(displayNumbers[Math.floor(Math.random() * displayNumbers.length)]);
+  }
+  
+  // A simple shuffle to randomize button positions
+  const shuffledNumbers = displayNumbers.sort(() => Math.random() - 0.5);
+
+  return (
+    <div className="grid grid-cols-5 gap-2">
+      {shuffledNumbers.slice(0, padSize).map((num, index) => (
+        <button
+          key={index}
+          onClick={() => onNumberClick(num)}
+          disabled={disabled}
+          className="flex items-center justify-center p-2 h-12 text-xl font-bold bg-gray-100 rounded-lg border border-gray-200 
+                     hover:bg-gray-200 active:scale-95 transform transition-all 
+                     disabled:bg-gray-50 disabled:text-gray-400 disabled:cursor-not-allowed disabled:transform-none"
+        >
+          {num}
+        </button>
+      ))}
+    </div>
+  );
+};
+
+export default NumberPad;
+import React, { useState, useEffect } from 'react';
+
+const loadingMessages = [
+  "완벽한 챌린지를 생성 중...",
+  "연필을 깎는 중...",
+  "숫자를 계산하고 있어요...",
+  "X, Y, Z 값을 푸는 중...",
+  "알고 계셨나요? 수학 퍼즐은 기억력을 향상시킬 수 있어요.",
+  "두뇌 운동을 준비하세요!",
+  "0으로 나누는 중... 농담이에요!",
+];
+
+const LoadingSpinner: React.FC = () => {
+  const [messageIndex, setMessageIndex] = useState(0);
+
+  useEffect(() => {
+    const intervalId = setInterval(() => {
+      setMessageIndex((prevIndex) => (prevIndex + 1) % loadingMessages.length);
+    }, 2500); // 2.5초마다 메시지 변경
+
+    return () => clearInterval(intervalId); // 컴포넌트 언마운트 시 정리
+  }, []);
+
+  return (
+    <div className="flex flex-col items-center justify-center gap-4 text-center">
+      <div className="w-12 h-12 border-4 border-blue-500 border-t-transparent rounded-full animate-spin"></div>
+      <p className="text-slate-600 font-medium px-4 h-10 flex items-center transition-opacity duration-500">
+        {loadingMessages[messageIndex]}
+      </p>
+    </div>
+  );
+};
+
+export default LoadingSpinner;
+import React from 'react';
+
+type IconProps = React.SVGProps<SVGSVGElement>;
+
+export const RefreshCwIcon: React.FC<IconProps> = (props) => (
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    width="24"
+    height="24"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    {...props}
+  >
+    <path d="M3 12a9 9 0 0 1 9-9c2.39 0 4.68.94 6.34 2.6" />
+    <path d="M21 3v6h-6" />
+    <path d="M21 12a9 9 0 0 1-9 9c-2.39 0-4.68-.94-6.34-2.6" />
+    <path d="M3 21v-6h6" />
+  </svg>
+);
+
+export const HeartIcon: React.FC<IconProps> = (props) => (
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    width="24"
+    height="24"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    {...props}
+  >
+    <path d="M19 14c1.49-1.46 3-3.21 3-5.5A5.5 5.5 0 0 0 16.5 3c-1.76 0-3 .5-4.5 2-1.5-1.5-2.74-2-4.5-2A5.5 5.5 0 0 0 2 8.5c0 2.3 1.5 4.05 3 5.5l7 7Z" />
+  </svg>
+);
+
+export const PartyPopperIcon: React.FC<IconProps> = (props) => (
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    width="24"
+    height="24"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    {...props}
+  >
+    <path d="M5.8 11.3 2 22l10.7-3.79" />
+    <path d="M4 14.8 13.2 5.6" />
+    <path d="m14 4 6 6" />
+    <path d="M10.4 15.6 14 12l.4-4.5 2.1-.1-2.1-2.1.1-2.1-4.5.4-3.6 3.6" />
+    <path d="M18 8.4 22 12" />
+  </svg>
+);
+
+export const FrownIcon: React.FC<IconProps> = (props) => (
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    width="24"
+    height="24"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    {...props}
+  >
+    <circle cx="12" cy="12" r="10" />
+    <path d="M16 16s-1.5-2-4-2-4 2-4 2" />
+    <line x1="9" x2="9.01" y1="9" y2="9" />
+    <line x1="15" x2="15.01" y1="9" y2="9" />
+  </svg>
+);
+
+export const AlertTriangleIcon: React.FC<IconProps> = (props) => (
+  <svg
+    xmlns="http://www.w3.org/2000/svg"
+    width="24"
+    height="24"
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    {...props}
+  >
+    <path d="m21.73 18-8-14a2 2 0 0 0-3.46 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z" />
+    <line x1="12" x2="12" y1="9" y2="13" />
+    <line x1="12" x2="12.01" y1="17" y2="17" />
+  </svg>
+);
+
+export const ArrowRightIcon: React.FC<IconProps> = (props) => (
+    <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...props}>
+        <line x1="5" y1="12" x2="19" y2="12"></line>
+        <polyline points="12 5 19 12 12 19"></polyline>
+    </svg>
+);
+
