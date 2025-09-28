@@ -103,7 +103,11 @@ const GameOverlay: React.FC<{status: GameStatus; onRestart: () => void; onNextLe
     if (!currentContent) return null;
     return (<div className="absolute inset-0 bg-white/80 backdrop-blur-sm flex items-center justify-center z-20 rounded-lg"><div className="text-center p-8 bg-white rounded-xl shadow-lg flex flex-col items-center gap-4 w-4/5">{currentContent.icon}<h2 className="text-2xl font-bold text-slate-800">{currentContent.title}</h2><p className="text-slate-600">{currentContent.message}</p><div className="w-full mt-4">{currentContent.buttons}</div></div></div>);
 };
-
+const getDifficultyForLevel = (lvl: number): Difficulty => {
+  if (lvl > 5) return 'Hard';
+  if (lvl > 2) return 'Medium';
+  return 'Easy';
+};
 //========== MAIN APP COMPONENT (메인 게임 컴포넌트) ==========
 const App: React.FC = () => {
     // API 키를 여기에 직접 입력하세요. (따옴표 안에)
@@ -195,3 +199,4 @@ const rootElement = document.getElementById('root');
 if (!rootElement) { throw new Error("Could not find root element to mount to"); }
 const root = ReactDOM.createRoot(rootElement);
 root.render(<React.StrictMode><App /></React.StrictMode>);
+
