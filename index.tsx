@@ -111,7 +111,7 @@ const getDifficultyForLevel = (lvl: number): Difficulty => {
 //========== MAIN APP COMPONENT (메인 게임 컴포넌트) ==========
 const App: React.FC = () => {
     // 
-    const API_KEY = "gen-lang-client-0051941912";
+    const API_KEY = "gentle-oxygen-468612-p9";
 
     const [gameStatus, setGameStatus] = useState<GameStatus>('LOADING');
     const [puzzle, setPuzzle] = useState<Puzzle | null>(null);
@@ -129,7 +129,7 @@ const App: React.FC = () => {
     useEffect(() => { if (score > highScore) { setHighScore(score); localStorage.setItem('mathCrosswordHighScore', String(score)); } }, [score, highScore]);
     
     const fetchPuzzleFromAI = useCallback(async (difficultyToFetch: Difficulty): Promise<Puzzle> => {
-        if (!API_KEY || API_KEY === "YOUR_API_KEY") {
+        if (!API_KEY || API_KEY === "gentle-oxygen-468612-p9") {
             setGameStatus('ERROR');
             throw new Error("API_KEY is not set. Please add your API key.");
         }
@@ -199,5 +199,6 @@ const rootElement = document.getElementById('root');
 if (!rootElement) { throw new Error("Could not find root element to mount to"); }
 const root = ReactDOM.createRoot(rootElement);
 root.render(<React.StrictMode><App /></React.StrictMode>);
+
 
 
