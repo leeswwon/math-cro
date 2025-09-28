@@ -110,8 +110,8 @@ const getDifficultyForLevel = (lvl: number): Difficulty => {
 };
 //========== MAIN APP COMPONENT (메인 게임 컴포넌트) ==========
 const App: React.FC = () => {
-    // API 키를 여기에 직접 입력하세요. (따옴표 안에)
-    const API_KEY = "AIzaSyA-xksLz5GMGgW-MPku9XFHtQkLT6HwoaI";
+    // 
+    const API_KEY = "gen-lang-client-0051941912";
 
     const [gameStatus, setGameStatus] = useState<GameStatus>('LOADING');
     const [puzzle, setPuzzle] = useState<Puzzle | null>(null);
@@ -199,4 +199,5 @@ const rootElement = document.getElementById('root');
 if (!rootElement) { throw new Error("Could not find root element to mount to"); }
 const root = ReactDOM.createRoot(rootElement);
 root.render(<React.StrictMode><App /></React.StrictMode>);
+
 
